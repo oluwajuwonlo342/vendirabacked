@@ -26,6 +26,8 @@ const userSchema = new mongoose.Schema({
     enum: ['CUSTOMER', 'VENDOR', 'ADMIN', 'SUPER_ADMIN'], 
     default: 'CUSTOMER' 
   },
+  resetPasswordToken: { type: String, select: false },
+resetPasswordExpires: { type: Date, select: false },
   isActive: { 
     type: Boolean, 
     default: true 
