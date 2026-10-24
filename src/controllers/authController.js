@@ -158,3 +158,82 @@ exports.updatePassword = async (req, res) => {
     res.status(500).json({ error: 'Server error updating password.' });
   }
 };
+exports.forgotPassword = async (req, res) => {
+  // Same answer whether or not the account exists
+  const genericResponse = {
+    status: 'success',
+    message: 'If an account with that email exists, a reset link has been sent.',
+  };
+
+  try {
+    const email = req.body.email?.trim();
+    if (!email) {
+      return res.status(400).json({ error: 'Please enter your email address.' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) return res.status(200).json(genericResponse);
+
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    user.resetPasswordToken = hashToken(rawToken); // only the hash is stored
+    user.resetPasswordExpires = new Date(Date.now() + RESET_WINDOW_MS);
+    await user.save({ validateBeforeSave: false });
+
+    const clientUrl = (process.env.CLIENT_URL || '').split(',')[0].trim().replace(/\/$/, '');
+    const resetUrl = `${clientUrl}/reset-password/${rawToken}`;
+
+    // Not awaited, so response time doesn't reveal whether the account exists
+    sendEmail({
+      to: user.email,
+      subject: 'Reset your Vendira password',
+      text: `Hi ${user.name || 'there'},\n\nUse this link to reset your password. It expires in 30 minutes:\n${resetUrl}\n\nIf you didn't request this, you can ignore this email.`,
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#111827">
+          <h2 style="color:#128C7E">Reset your password</h2>
+          <p>Hi ${user.name || 'there'},</p>
+          <p>Click the button below to choose a new password. This link expires in 30 minutes.</p>
+          <p style="margin:28px 0">
+            <a href="${resetUrl}" style="background:#128C7E;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Reset password</a>
+          </p>
+          <p style="font-size:13px;color:#6b7280">Or paste this link into your browser:<br>${resetUrl}</p>
+          <p style="font-size:13px;color:#6b7280">If you didn't request this, you can safely ignore this email.</p>
+        </div>`,
+    }).catch((err) => console.error('Reset email failed:', err.message));
+
+    res.status(200).json(genericResponse);
+  } catch (error) {
+    console.error('Forgot Password Error:', error);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+};
+
+exports.resetPassword = async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { password } = req.body;
+
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+    }
+
+    const user = await User.findOne({
+      resetPasswordToken: hashToken(token),
+      resetPasswordExpires: { $gt: Date.now() },
+    });
+
+    if (!user) {
+      return res.status(400).json({ error: 'This reset link is invalid or has expired. Please request a new one.' });
+    }
+
+    // Hashed manually, same as registerVendor and updatePassword
+    user.password = await bcrypt.hash(password, await bcrypt.genSalt(10));
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save({ validateBeforeSave: false });
+
+    res.status(200).json({ status: 'success', message: 'Password reset successful. You can now log in.' });
+  } catch (error) {
+    console.error('Reset Password Error:', error);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+};
