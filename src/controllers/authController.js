@@ -1,7 +1,11 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const sendEmail = require('../utils/sendEmail');
 
+const RESET_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
+const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
 const signToken = (id, role) => {
   return jwt.sign({ id, role }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN
