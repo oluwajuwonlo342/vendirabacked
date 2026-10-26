@@ -30,6 +30,7 @@ app.use('/api/stores', require('./src/routes/storeRoutes'));
 app.use('/api/products', require('./src/routes/productRoutes'));
 app.use('/api/categories', require('./src/routes/categoryRoutes'));
 app.use('/api/feedback', require('./src/routes/feedbackRoutes'));
+app.use('/api/guide', require('./src/routes/guideRoutes'));
 app.use('/api/admin', adminRoutes);
 app.use('/api/categories', categoryRoutes);
 // Base Route
