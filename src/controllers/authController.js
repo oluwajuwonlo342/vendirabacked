@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const sendEmail = require('../utils/sendEmail');
+const { sendWelcomeEmail } = require('./guideController');
 
 const RESET_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
 const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
@@ -41,7 +42,8 @@ exports.registerVendor = async (req, res) => {
       phone,
       role: 'VENDOR'
     });
-
+// Not awaited, so a slow or failing email never blocks signup
+sendWelcomeEmail(user).catch((err) => console.error('Welcome email failed:', err.message));
     const token = signToken(user._id, user.role);
 
     res.status(201).json({
