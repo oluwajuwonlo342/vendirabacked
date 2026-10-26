@@ -1,8 +1,12 @@
 const Product = require('../models/Product');
 const Store = require('../models/Store');
-require('../models/Category'); // makes sure the model is registered for populate()
+const Category = require('../models/Category');
 const mongoose = require('mongoose');
 const slugify = require('slugify');
+const cloudinary = require('cloudinary').v2;
+
+const MAX_IMAGES = 5;
+const STATUSES = ['available', 'limited', 'out_of_stock', 'sold_out', 'hidden'];
 
 const getVendorId = (req) => {
   return req.user?._id || req.user?.id || req.userId || req.user;
@@ -11,43 +15,69 @@ const getVendorId = (req) => {
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 
 // ==========================================
+// HELPERS
+// ==========================================
+const destroyAsset = async (asset, resourceType = 'image') => {
+  if (!asset?.public_id) return;
+  try {
+    await cloudinary.uploader.destroy(asset.public_id, { resource_type: resourceType });
+  } catch (err) {
+    console.error('Cloudinary cleanup failed:', err.message);
+  }
+};
+
+// Multer uploads files to Cloudinary before the controller runs, so when a request
+// is rejected afterwards, those fresh uploads must be deleted or they become orphans.
+const discardUploads = async (req) => {
+  await Promise.all([
+    ...(req.files?.images || []).map((f) => destroyAsset({ public_id: f.filename })),
+    ...(req.files?.video || []).map((f) => destroyAsset({ public_id: f.filename }, 'video')),
+  ]);
+};
+
+const parseJsonArray = (value) => {
+  if (value === undefined || value === '') return [];
+  const parsed = JSON.parse(value);
+  return Array.isArray(parsed) ? parsed : [];
+};
+
+// ==========================================
 // VENDOR: Create Product
 // ==========================================
 exports.createProduct = async (req, res) => {
+  const fail = async (code, error) => {
+    await discardUploads(req);
+    return res.status(code).json({ error });
+  };
+
   try {
     const vendorId = getVendorId(req);
-    if (!vendorId) return res.status(401).json({ error: 'Unauthorized.' });
+    if (!vendorId) return fail(401, 'Unauthorized.');
 
     const store = await Store.findOne({ vendor: vendorId });
-    if (!store) {
-      return res.status(400).json({ error: 'You must set up your store profile first.' });
-    }
+    if (!store) return fail(400, 'You must set up your store profile first.');
 
     const { name, description, price, category } = req.body;
 
-    if (!name || !name.trim()) {
-      return res.status(400).json({ error: 'Product name is required.' });
-    }
+    if (!name || !name.trim()) return fail(400, 'Product name is required.');
+    if (!description || !description.trim()) return fail(400, 'A description is required.');
     if (!price || Number.isNaN(Number(price)) || Number(price) < 0) {
-      return res.status(400).json({ error: 'A valid price is required.' });
+      return fail(400, 'A valid price is required.');
     }
-    // Reject instead of saving a product pointing at a category that doesn't exist
-    if (!isValidId(category)) {
-      return res.status(400).json({ error: 'A valid category is required.' });
-    }
+    if (!isValidId(category)) return fail(400, 'Please select a category.');
 
-    // Parse the stringified dynamic attributes from the frontend
+    // The category must belong to this vendor's store
+    const categoryDoc = await Category.findOne({ _id: category, store: store._id });
+    if (!categoryDoc) return fail(400, 'Selected category was not found in your store.');
+
     let parsedAttributes = [];
     if (req.body.attributes) {
       try {
-        parsedAttributes = JSON.parse(req.body.attributes).filter(a => a.name && a.value);
-      } catch (err) {
-        console.error('Failed to parse attributes:', err);
+        parsedAttributes = parseJsonArray(req.body.attributes).filter((a) => a.name && a.value);
+      } catch {
+        return fail(400, 'Variations were not in the right format.');
       }
     }
-
-    const baseSlug = slugify(name, { lower: true, strict: true });
-    const uniqueSlug = `${baseSlug}-${Math.random().toString(36).substring(2, 8)}`;
 
     const imagesArray = (req.files?.images || []).map((file, index) => ({
       public_id: file.filename,
@@ -60,14 +90,17 @@ exports.createProduct = async (req, res) => {
       ? { public_id: videoFile.filename, url: videoFile.path }
       : undefined;
 
+    const baseSlug = slugify(name, { lower: true, strict: true }) || 'product';
+    const uniqueSlug = `${baseSlug}-${Math.random().toString(36).substring(2, 8)}`;
+
     const product = await Product.create({
       vendor: vendorId,
       store: store._id,
       name: name.trim(),
       slug: uniqueSlug,
-      description: description || '',
+      description: description.trim(),
       price: Number(price),
-      category,
+      category: categoryDoc._id,
       images: imagesArray,
       video: videoData,
       attributes: parsedAttributes,
@@ -77,7 +110,125 @@ exports.createProduct = async (req, res) => {
     res.status(201).json({ status: 'success', data: { product } });
   } catch (error) {
     console.error('Create Product Error:', error);
-    res.status(500).json({ error: error.message || 'Server error creating product' });
+    await discardUploads(req);
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ error: Object.values(error.errors)[0].message });
+    }
+    res.status(500).json({ error: 'Server error creating product.' });
+  }
+};
+
+// ==========================================
+// VENDOR: Update a Product
+// ==========================================
+exports.updateProduct = async (req, res) => {
+  let saved = false;
+
+  const fail = async (code, error) => {
+    await discardUploads(req);
+    return res.status(code).json({ error });
+  };
+
+  try {
+    const vendorId = getVendorId(req);
+    const { productId } = req.params;
+
+    if (!isValidId(productId)) return fail(400, 'Invalid product ID.');
+
+    const product = await Product.findOne({ _id: productId, vendor: vendorId });
+    if (!product) return fail(404, 'Product not found or unauthorized.');
+
+    const { name, description, price, category, status } = req.body;
+
+    if (name !== undefined) {
+      if (!name.trim()) return fail(400, 'Product name cannot be empty.');
+      product.name = name.trim();
+    }
+    if (description !== undefined) {
+      if (!description.trim()) return fail(400, 'Description cannot be empty.');
+      product.description = description.trim();
+    }
+    if (price !== undefined) {
+      const numericPrice = Number(price);
+      if (price === '' || Number.isNaN(numericPrice) || numericPrice < 0) {
+        return fail(400, 'Enter a valid price.');
+      }
+      product.price = numericPrice;
+    }
+    if (status !== undefined) {
+      if (!STATUSES.includes(status)) return fail(400, 'Invalid status.');
+      product.status = status;
+    }
+    if (category !== undefined) {
+      if (!isValidId(category)) return fail(400, 'Please select a category.');
+      const categoryDoc = await Category.findOne({ _id: category, store: product.store });
+      if (!categoryDoc) return fail(400, 'Selected category was not found in your store.');
+      product.category = categoryDoc._id;
+    }
+
+    if (req.body.attributes !== undefined) {
+      try {
+        product.attributes = parseJsonArray(req.body.attributes).filter((a) => a.name && a.value);
+      } catch {
+        return fail(400, 'Variations were not in the right format.');
+      }
+    }
+
+    // Images: drop the ones the vendor removed, append new uploads, enforce the limit
+    let removeIds;
+    try {
+      removeIds = parseJsonArray(req.body.removeImages);
+    } catch {
+      return fail(400, 'Photo list was not in the right format.');
+    }
+
+    const keptImages = product.images.filter((img) => !removeIds.includes(img.public_id));
+    const removedImages = product.images.filter((img) => removeIds.includes(img.public_id));
+    const newImages = (req.files?.images || []).map((file) => ({
+      public_id: file.filename,
+      url: file.path,
+    }));
+
+    if (keptImages.length + newImages.length > MAX_IMAGES) {
+      return fail(400, `A product can have at most ${MAX_IMAGES} photos.`);
+    }
+
+    product.images = [
+      ...keptImages.map((img) => ({ public_id: img.public_id, url: img.url })),
+      ...newImages,
+    ].map((img, index) => ({ ...img, isThumbnail: index === 0 }));
+
+    // Video: replace it, remove it, or leave it alone
+    const newVideoFile = req.files?.video?.[0];
+    const oldVideo = product.video?.url ? { public_id: product.video.public_id } : null;
+    let videoToDestroy = null;
+
+    if (newVideoFile) {
+      product.video = { public_id: newVideoFile.filename, url: newVideoFile.path };
+      videoToDestroy = oldVideo;
+    } else if (req.body.removeVideo === 'true' && oldVideo) {
+      product.set('video', undefined);
+      videoToDestroy = oldVideo;
+    }
+
+    await product.save();
+    saved = true;
+
+    // Delete replaced media only after the database save succeeded
+    await Promise.all([
+      ...removedImages.map((img) => destroyAsset(img)),
+      videoToDestroy ? destroyAsset(videoToDestroy, 'video') : null,
+    ]);
+
+    await product.populate('category', 'name');
+    res.status(200).json({ status: 'success', data: { product: product.toObject() } });
+  } catch (error) {
+    console.error('Update Product Error:', error);
+    if (!saved) await discardUploads(req); // once saved, the new files are in use
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ error: Object.values(error.errors)[0].message });
+    }
+    res.status(500).json({ error: 'Server error updating product.' });
   }
 };
 
@@ -92,7 +243,7 @@ exports.getVendorProducts = async (req, res) => {
       .populate('category', 'name')
       .sort({ createdAt: -1 });
 
-    const formattedProducts = products.map(p => {
+    const formattedProducts = products.map((p) => {
       const pObj = p.toObject();
       return {
         ...pObj,
@@ -115,11 +266,21 @@ exports.deleteProduct = async (req, res) => {
     const vendorId = getVendorId(req);
     const { productId } = req.params;
 
+    if (!isValidId(productId)) {
+      return res.status(400).json({ error: 'Invalid product ID.' });
+    }
+
     const product = await Product.findOneAndDelete({ _id: productId, vendor: vendorId });
 
     if (!product) {
       return res.status(404).json({ error: 'Product not found or unauthorized' });
     }
+
+    // Remove the product's media from Cloudinary
+    await Promise.all([
+      ...product.images.map((img) => destroyAsset(img)),
+      product.video?.url ? destroyAsset(product.video, 'video') : null,
+    ]);
 
     res.status(200).json({ status: 'success', message: 'Product deleted successfully' });
   } catch (error) {
@@ -142,7 +303,7 @@ exports.getPublicProducts = async (req, res) => {
       store: storeId,
       status: { $in: ['available', 'limited'] },
     })
-      .populate('category', 'name') // fixes "Uncategorized" on the storefront
+      .populate('category', 'name')
       .sort({ createdAt: -1 });
 
     res.status(200).json({ status: 'success', data: { products } });
@@ -159,6 +320,10 @@ exports.addProductFeedback = async (req, res) => {
   try {
     const { productId } = req.params;
     const { customerName, rating, comment } = req.body;
+
+    if (!isValidId(productId)) {
+      return res.status(400).json({ error: 'Invalid product ID.' });
+    }
 
     const numericRating = Number(rating);
     if (!Number.isInteger(numericRating) || numericRating < 1 || numericRating > 5) {
@@ -199,6 +364,7 @@ exports.addProductFeedback = async (req, res) => {
 // ==========================================
 exports.recordProductView = async (req, res) => {
   try {
+    if (!isValidId(req.params.productId)) return res.status(400).json({ error: 'Invalid product ID.' });
     await Product.findByIdAndUpdate(req.params.productId, { $inc: { views: 1 } });
     res.status(200).json({ success: true });
   } catch (error) {
@@ -212,6 +378,7 @@ exports.recordProductView = async (req, res) => {
 // ==========================================
 exports.recordWhatsAppClick = async (req, res) => {
   try {
+    if (!isValidId(req.params.productId)) return res.status(400).json({ error: 'Invalid product ID.' });
     await Product.findByIdAndUpdate(req.params.productId, { $inc: { whatsappClicks: 1 } });
     res.status(200).json({ success: true });
   } catch (error) {
