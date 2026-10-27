@@ -299,6 +299,14 @@ exports.getPublicProducts = async (req, res) => {
       return res.status(400).json({ error: 'Invalid store ID' });
     }
 
+    // Draft, suspended and banned stores expose nothing, even if someone has the store ID
+    const live = await Store.exists({
+      _id: storeId,
+      isPublished: { $ne: false },
+      status: { $nin: ['suspended', 'banned'] },
+    });
+    if (!live) return res.status(404).json({ error: 'Store not found' });
+
     const products = await Product.find({
       store: storeId,
       status: { $in: ['available', 'limited'] },
@@ -311,9 +319,7 @@ exports.getPublicProducts = async (req, res) => {
     console.error('Fetch Public Products Error:', error);
     res.status(500).json({ error: 'Server error fetching store products' });
   }
-};
-
-// ==========================================
+};// ==========================================
 // PUBLIC: Add Customer Feedback/Review
 // ==========================================
 exports.addProductFeedback = async (req, res) => {
