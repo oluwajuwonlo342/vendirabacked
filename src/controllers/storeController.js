@@ -1,10 +1,15 @@
 const Store = require('../models/Store');
 const slugify = require('slugify');
 const cloudinary = require('cloudinary').v2;
+const { normalizeWhatsapp } = require('../utils/whatsapp');
 
-const formatStoreResponse = (store) => {
+// Stores an admin has suspended or banned never appear publicly
+const HIDDEN_STATUSES = ['suspended', 'banned'];
+
+const formatStoreResponse = (store, { publicView = false } = {}) => {
   const storeObj = store.toObject ? store.toObject() : store;
   storeObj.name = storeObj.businessName;
+  if (publicView) delete storeObj.vendor; // customers don't need the owner's account ID
   return storeObj;
 };
 
@@ -30,78 +35,126 @@ const removeOldImage = async (image) => {
   }
 };
 
+// Multer uploads to Cloudinary before the controller runs, so when a request is
+// rejected afterwards those fresh uploads must be deleted or they become orphans.
+const discardUploads = (req) =>
+  Promise.all(Object.values(req.files || {}).flat().map((f) => removeOldImage({ public_id: f.filename })));
+
+// ==========================================
+// VENDOR: Create a store (starts as a private draft)
+// ==========================================
 exports.createStore = async (req, res) => {
+  const fail = async (code, error) => {
+    await discardUploads(req);
+    return res.status(code).json({ error });
+  };
+
   try {
-    const { name, description, whatsappNumber } = req.body;
     const vendorId = getVendorId(req);
-    
-    if (!vendorId) return res.status(401).json({ error: 'Unauthorized: Vendor ID not found.' });
-    
-    const rawSlug = req.body.slug || name;
-    if (!rawSlug || typeof rawSlug !== 'string') {
-      return res.status(400).json({ error: 'Store slug must be provided.' });
-    }
-    
-    const slug = slugify(rawSlug, { lower: true, strict: true });
-    
+    if (!vendorId) return fail(401, 'Unauthorized: Vendor ID not found.');
+
+    const name = String(req.body.name ?? '').trim();
+    if (!name) return fail(400, 'Your store needs a name.');
+
+    const whatsappNumber = normalizeWhatsapp(req.body.whatsappNumber);
+    if (!whatsappNumber) return fail(400, 'Enter a valid WhatsApp number, for example 08012345678.');
+
+    const slug = slugify(String(req.body.slug || name), { lower: true, strict: true });
+    if (!slug) return fail(400, 'Choose a store URL using letters or numbers.');
+
     const existingStore = await Store.findOne({ vendor: vendorId });
-    if (existingStore) {
-      return res.status(400).json({ error: 'You already have a store registered.' });
-    }
-    
+    if (existingStore) return fail(400, 'You already have a store registered.');
+
     const store = await Store.create({
       businessName: name,
       slug,
-      description,
+      description: String(req.body.description ?? '').trim().slice(0, 500),
       whatsappNumber,
-      vendor: vendorId, // Matches your Schema exactly
+      vendor: vendorId,
+      isPublished: false, // customers can't see it until the vendor publishes from Store Setup
       ...extractImages(req),
     });
-    
+
     res.status(201).json({ status: 'success', data: { store: formatStoreResponse(store) } });
   } catch (error) {
     console.error('Create Store Error:', error);
+    await discardUploads(req);
     if (error.code === 11000) return res.status(400).json({ error: 'This Store URL is already taken.' });
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ error: Object.values(error.errors)[0].message });
+    }
     res.status(500).json({ error: 'Server error creating store' });
   }
 };
 
+// ==========================================
+// VENDOR: Update own store
+// ==========================================
 exports.updateMyStore = async (req, res) => {
+  let saved = false;
+  const fail = async (code, error) => {
+    await discardUploads(req);
+    return res.status(code).json({ error });
+  };
+
   try {
     const vendorId = getVendorId(req);
     const { name, description, whatsappNumber, slug } = req.body;
-    
+
     const existing = await Store.findOne({ vendor: vendorId });
-    if (!existing) return res.status(404).json({ error: 'Store not found' });
-    
+    if (!existing) return fail(404, 'Store not found');
+
+    // Only set fields that were actually sent
     const updateData = {};
-    if (name) updateData.businessName = name;
-    if (description !== undefined) updateData.description = description;
-    if (whatsappNumber) updateData.whatsappNumber = whatsappNumber;
-    if (slug && typeof slug === 'string') {
-      updateData.slug = slugify(slug, { lower: true, strict: true });
+
+    if (name !== undefined) {
+      const trimmed = String(name).trim();
+      if (!trimmed) return fail(400, 'Your store needs a name.');
+      updateData.businessName = trimmed;
     }
-    
+    if (description !== undefined) {
+      updateData.description = String(description).trim().slice(0, 500);
+    }
+    if (whatsappNumber !== undefined && String(whatsappNumber).trim() !== '') {
+      const normalized = normalizeWhatsapp(whatsappNumber);
+      if (!normalized) return fail(400, 'Enter a valid WhatsApp number, for example 08012345678.');
+      updateData.whatsappNumber = normalized;
+    }
+    if (slug !== undefined && String(slug).trim() !== '') {
+      const cleanSlug = slugify(String(slug), { lower: true, strict: true });
+      if (!cleanSlug) return fail(400, 'Choose a store URL using letters or numbers.');
+      updateData.slug = cleanSlug;
+    }
+
     const images = extractImages(req);
     Object.assign(updateData, images);
-    
+
     const store = await Store.findOneAndUpdate(
       { vendor: vendorId },
       { $set: updateData },
       { new: true, runValidators: true }
     );
-    
+    saved = true;
+
+    // Clean up replaced images only after the DB update succeeded
     if (images.logo) await removeOldImage(existing.logo);
     if (images.coverImage) await removeOldImage(existing.coverImage);
-    
+
     res.status(200).json({ status: 'success', data: { store: formatStoreResponse(store) } });
   } catch (error) {
     console.error('Update Store Error:', error);
+    if (!saved) await discardUploads(req);
     if (error.code === 11000) return res.status(400).json({ error: 'This Store URL is already taken.' });
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ error: Object.values(error.errors)[0].message });
+    }
     res.status(500).json({ error: 'Server error updating store' });
   }
 };
 
+// ==========================================
+// VENDOR: Get own store
+// ==========================================
 exports.getMyStore = async (req, res) => {
   try {
     const store = await Store.findOne({ vendor: getVendorId(req) });
@@ -113,11 +166,18 @@ exports.getMyStore = async (req, res) => {
   }
 };
 
+// ==========================================
+// PUBLIC: Fetch a store by slug (published stores only)
+// ==========================================
 exports.getStoreBySlug = async (req, res) => {
   try {
-    const store = await Store.findOne({ slug: req.params.storeSlug });
+    const store = await Store.findOne({
+      slug: String(req.params.storeSlug || '').toLowerCase(),
+      isPublished: { $ne: false },      // a missing flag means "live", so existing stores stay up
+      status: { $nin: HIDDEN_STATUSES },
+    });
     if (!store) return res.status(404).json({ error: 'Store not found' });
-    res.status(200).json({ status: 'success', data: { store: formatStoreResponse(store) } });
+    res.status(200).json({ status: 'success', data: { store: formatStoreResponse(store, { publicView: true }) } });
   } catch (error) {
     console.error('Fetch Store By Slug Error:', error);
     res.status(500).json({ error: 'Server error fetching store profile' });
