@@ -26,6 +26,9 @@ const userSchema = new mongoose.Schema({
     enum: ['CUSTOMER', 'VENDOR', 'ADMIN', 'SUPER_ADMIN'], 
     default: 'CUSTOMER' 
   },
+  remindersOptOut: { type: Boolean, default: false },
+onboardingReminderCount: { type: Number, default: 0 },
+lastOnboardingReminderAt: { type: Date },
   welcomeEmailSentAt: { type: Date },
   resetPasswordToken: { type: String, select: false },
 resetPasswordExpires: { type: Date, select: false },
