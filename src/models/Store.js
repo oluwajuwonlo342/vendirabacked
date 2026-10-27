@@ -45,6 +45,17 @@ const storeSchema = new mongoose.Schema({
     ref: 'User',
     required: true
   },
+  businessType: { type: String, trim: true, maxlength: 60 },
+socialLinks: {
+  instagram: String,
+  facebook: String,
+  tiktok: String,
+  twitter: String,
+  website: String,
+},
+// Stores created before this feature have no value, so everything below treats "not false" as live
+isPublished: { type: Boolean, default: true },
+publishedAt: { type: Date },
 
   // Verification & Status
   isVerified: { type: Boolean, default: false },
