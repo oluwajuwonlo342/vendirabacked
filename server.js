@@ -6,7 +6,7 @@ const morgan = require('morgan');
 const connectDB = require('./src/config/db');
 const categoryRoutes = require('./src/routes/categoryRoutes');
 const adminRoutes = require('./src/routes/adminRoutes');
-const onboardingRoutes = require('./routes/onboardingRoutes');
+const onboardingRoutes = require('./src/routes/onboardingRoutes');
 
 // Initialize Express App
 const app = express();
