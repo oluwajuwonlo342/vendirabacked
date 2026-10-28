@@ -1,7 +1,10 @@
 const Store = require('../models/Store');
 const slugify = require('slugify');
 const cloudinary = require('cloudinary').v2;
-const { normalizeWhatsapp } = require('../utils/whatsapp');
+const { normalizeWhatsapp, WHATSAPP_HELP } = require('../utils/whatsapp');
+
+const CURRENCIES = ['NGN', 'GHS', 'KES', 'ZAR', 'UGX', 'TZS', 'USD', 'GBP', 'EUR'];
+const CTA_MODES = ['order', 'enquire'];
 
 // Stores an admin has suspended or banned never appear publicly
 const HIDDEN_STATUSES = ['suspended', 'banned'];
