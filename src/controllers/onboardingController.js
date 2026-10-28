@@ -7,7 +7,7 @@ const Product = require('../models/Product');
 const Category = require('../models/Category');
 const User = require('../models/User');
 const sendEmail = require('../utils/sendEmail');
-
+const { normalizeWhatsapp: toDigits, WHATSAPP_HELP } = require('../utils/whatsapp');
 const DAY = 24 * 60 * 60 * 1000;
 const MAX_REMINDERS = 2;
 const REMINDERS_PER_RUN = 50;
@@ -36,14 +36,10 @@ const discardUploads = (req) =>
   Promise.all(Object.values(req.files || {}).flat().map((f) => destroy(f.filename)));
 
 // WhatsApp links (wa.me) need international digits: 08012345678 -> 2348012345678
+// Same rules as My Store, so both pages agree on what a valid number is
 const normalizeWhatsapp = (raw) => {
-  let digits = String(raw ?? '').replace(/\D/g, '');
-  if (digits.startsWith('00')) digits = digits.slice(2);
-  if (digits.length === 11 && digits.startsWith('0')) digits = `234${digits.slice(1)}`;
-  else if (digits.length === 10 && /^[789]/.test(digits)) digits = `234${digits}`;
-  if (digits.length < 10 || digits.length > 15) {
-    throw new InputError('Enter a valid WhatsApp number, for example 08012345678.');
-  }
+  const digits = toDigits(raw);
+  if (!digits) throw new InputError(WHATSAPP_HELP);
   return digits;
 };
 
@@ -113,7 +109,7 @@ const buildChecklist = (store, productCount) => {
 
   return [
     { key: 'name', step: 1, label: 'Name your store', done: Boolean(s?.businessName), required: true },
-    { key: 'whatsapp', step: 1, label: 'Add your WhatsApp number', done: Boolean(s?.whatsappNumber), required: true },
+  { key: 'whatsapp', step: 1, label: 'Add your WhatsApp number', done: Boolean(toDigits(s?.whatsappNumber)), required: true },
     { key: 'logo', step: 2, label: 'Upload your logo', done: Boolean(s?.logo?.url) },
     { key: 'cover', step: 2, label: 'Add a cover image', done: Boolean(s?.coverImage?.url) },
     { key: 'description', step: 3, label: 'Describe your business', done: Boolean(s?.description?.trim()) },
@@ -124,14 +120,13 @@ const buildChecklist = (store, productCount) => {
     { key: 'publish', step: 6, label: 'Publish your store', done: Boolean(s) && s.isPublished !== false, required: true },
   ];
 };
-
 const formatStore = (store) => {
   if (!store) return null;
   const obj = store.toObject();
   obj.name = obj.businessName;
+  obj.whatsappDigits = toDigits(obj.whatsappNumber);
   return obj;
 };
-
 const buildState = async (vendorId) => {
   const [owner, store] = await Promise.all([
     User.findById(vendorId).select('name email phone'),
