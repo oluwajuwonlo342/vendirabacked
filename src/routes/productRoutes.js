@@ -20,6 +20,7 @@ const makeLimiter = (limit, error) =>
 
 // Generous on purpose: many mobile users share one IP address
 const analyticsLimiter = makeLimiter(300, 'Too many requests. Please slow down.');
+const clickLimiter = makeLimiter(120, 'Too many requests. Please slow down.');
 const reviewLimiter = makeLimiter(20, 'Too many reviews submitted. Please try again later.');
 
 // ==========================================
@@ -28,7 +29,7 @@ const reviewLimiter = makeLimiter(20, 'Too many reviews submitted. Please try ag
 // ==========================================
 router.get('/store/:storeId', productController.getPublicProducts);
 router.post('/:productId/view', analyticsLimiter, productController.recordProductView);
-router.post('/:productId/click', analyticsLimiter, productController.recordWhatsAppClick);
+router.post('/:productId/click', clickLimiter, productController.recordWhatsAppClick);
 router.post('/:productId/feedback', reviewLimiter, productController.addProductFeedback);
 
 // ==========================================
@@ -40,6 +41,8 @@ const productUploads = upload.fields([
   { name: 'images', maxCount: 5 },
   { name: 'video', maxCount: 1 },
 ]);
+
+router.get('/analytics/whatsapp', productController.getWhatsAppAnalytics);
 
 router.post('/', productUploads, productController.createProduct);
 router.get('/', productController.getVendorProducts);
