@@ -56,6 +56,8 @@ socialLinks: {
 // Stores created before this feature have no value, so everything below treats "not false" as live
 isPublished: { type: Boolean, default: true },
 publishedAt: { type: Date },
+  currency: { type: String, enum: ['NGN', 'GHS', 'KES', 'ZAR', 'UGX', 'TZS', 'USD', 'GBP', 'EUR'], default: 'NGN' },
+whatsappCta: { type: String, enum: ['order', 'enquire'], default: 'order' },
 
   // Verification & Status
   isVerified: { type: Boolean, default: false },
