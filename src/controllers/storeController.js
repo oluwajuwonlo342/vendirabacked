@@ -12,6 +12,9 @@ const HIDDEN_STATUSES = ['suspended', 'banned'];
 const formatStoreResponse = (store, { publicView = false } = {}) => {
   const storeObj = store.toObject ? store.toObject() : store;
   storeObj.name = storeObj.businessName;
+  // The number the WhatsApp link needs, or null if the saved number can't work.
+  // Computed on every read, so numbers saved before this change (08012345678) still produce working links.
+  storeObj.whatsappDigits = normalizeWhatsapp(storeObj.whatsappNumber);
   if (publicView) delete storeObj.vendor; // customers don't need the owner's account ID
   return storeObj;
 };
@@ -43,6 +46,23 @@ const removeOldImage = async (image) => {
 const discardUploads = (req) =>
   Promise.all(Object.values(req.files || {}).flat().map((f) => removeOldImage({ public_id: f.filename })));
 
+// Reads the currency and WhatsApp button settings. Only fields that were sent are returned.
+const readSettings = (body) => {
+  const data = {};
+
+  if (body.currency !== undefined) {
+    const currency = String(body.currency).trim().toUpperCase();
+    if (!CURRENCIES.includes(currency)) return { error: 'Choose a supported currency.' };
+    data.currency = currency;
+  }
+  if (body.whatsappCta !== undefined) {
+    const cta = String(body.whatsappCta).trim();
+    if (!CTA_MODES.includes(cta)) return { error: 'Choose "Order" or "Enquire" for the WhatsApp button.' };
+    data.whatsappCta = cta;
+  }
+  return { data };
+};
+
 // ==========================================
 // VENDOR: Create a store (starts as a private draft)
 // ==========================================
@@ -60,7 +80,10 @@ exports.createStore = async (req, res) => {
     if (!name) return fail(400, 'Your store needs a name.');
 
     const whatsappNumber = normalizeWhatsapp(req.body.whatsappNumber);
-    if (!whatsappNumber) return fail(400, 'Enter a valid WhatsApp number, for example 08012345678.');
+    if (!whatsappNumber) return fail(400, WHATSAPP_HELP);
+
+    const settings = readSettings(req.body);
+    if (settings.error) return fail(400, settings.error);
 
     const slug = slugify(String(req.body.slug || name), { lower: true, strict: true });
     if (!slug) return fail(400, 'Choose a store URL using letters or numbers.');
@@ -75,6 +98,7 @@ exports.createStore = async (req, res) => {
       whatsappNumber,
       vendor: vendorId,
       isPublished: false, // customers can't see it until the vendor publishes from Store Setup
+      ...settings.data,
       ...extractImages(req),
     });
 
@@ -120,7 +144,7 @@ exports.updateMyStore = async (req, res) => {
     }
     if (whatsappNumber !== undefined && String(whatsappNumber).trim() !== '') {
       const normalized = normalizeWhatsapp(whatsappNumber);
-      if (!normalized) return fail(400, 'Enter a valid WhatsApp number, for example 08012345678.');
+      if (!normalized) return fail(400, WHATSAPP_HELP);
       updateData.whatsappNumber = normalized;
     }
     if (slug !== undefined && String(slug).trim() !== '') {
@@ -128,6 +152,10 @@ exports.updateMyStore = async (req, res) => {
       if (!cleanSlug) return fail(400, 'Choose a store URL using letters or numbers.');
       updateData.slug = cleanSlug;
     }
+
+    const settings = readSettings(req.body);
+    if (settings.error) return fail(400, settings.error);
+    Object.assign(updateData, settings.data);
 
     const images = extractImages(req);
     Object.assign(updateData, images);
