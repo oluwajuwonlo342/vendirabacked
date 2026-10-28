@@ -4,7 +4,7 @@ const Category = require('../models/Category');
 const mongoose = require('mongoose');
 const slugify = require('slugify');
 const cloudinary = require('cloudinary').v2;
-
+const WhatsAppStat = require('../models/WhatsAppStat');
 const MAX_IMAGES = 5;
 const STATUSES = ['available', 'limited', 'out_of_stock', 'sold_out', 'hidden'];
 
@@ -319,7 +319,9 @@ exports.getPublicProducts = async (req, res) => {
     console.error('Fetch Public Products Error:', error);
     res.status(500).json({ error: 'Server error fetching store products' });
   }
-};// ==========================================
+};
+
+// ==========================================
 // PUBLIC: Add Customer Feedback/Review
 // ==========================================
 exports.addProductFeedback = async (req, res) => {
@@ -382,13 +384,101 @@ exports.recordProductView = async (req, res) => {
 // ==========================================
 // PUBLIC: Record a WhatsApp Click
 // ==========================================
+// "YYYY-MM-DD" in Nigerian time (UTC+1)
+const dayKey = (date = new Date()) => new Date(date.getTime() + 60 * 60 * 1000).toISOString().slice(0, 10);
+
+// ==========================================
+// PUBLIC: Record a WhatsApp button tap
+// This counts taps on the button. It is not an order or a sale.
+// ==========================================
 exports.recordWhatsAppClick = async (req, res) => {
   try {
-    if (!isValidId(req.params.productId)) return res.status(400).json({ error: 'Invalid product ID.' });
-    await Product.findByIdAndUpdate(req.params.productId, { $inc: { whatsappClicks: 1 } });
+    const { productId } = req.params;
+    if (!isValidId(productId)) return res.status(400).json({ error: 'Invalid product ID.' });
+
+    const product = await Product.findByIdAndUpdate(
+      productId,
+      { $inc: { whatsappClicks: 1 } },
+      { new: true }
+    ).select('store');
+
+    if (product) {
+      const filter = { store: product.store, product: product._id, day: dayKey() };
+      try {
+        await WhatsAppStat.updateOne(filter, { $inc: { clicks: 1 } }, { upsert: true });
+      } catch (err) {
+        if (err.code !== 11000) throw err;
+        await WhatsAppStat.updateOne(filter, { $inc: { clicks: 1 } }); // two taps raced to create the row
+      }
+    }
+
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('Record click error:', error.message);
     res.status(500).json({ error: 'Failed to record click' });
+  }
+};
+exports.recordWhatsAppClick = async (req, res) => {
+  try {
+    const { productId } = req.params;
+    if (!isValidId(productId)) return res.status(400).json({ error: 'Invalid product ID.' });
+
+    const product = await Product.findByIdAndUpdate(
+      productId,
+      { $inc: { whatsappClicks: 1 } },
+      { new: true }
+    ).select('store');
+
+    if (product) {
+      const filter = { store: product.store, product: product._id, day: dayKey() };
+      try {
+        await WhatsAppStat.updateOne(filter, { $inc: { clicks: 1 } }, { upsert: true });
+      } catch (err) {
+        if (err.code !== 11000) throw err;
+        await WhatsAppStat.updateOne(filter, { $inc: { clicks: 1 } }); // two taps raced to create the row
+      }
+    }
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('Record click error:', error.message);
+    res.status(500).json({ error: 'Failed to record click' });
+  }
+};
+
+// ==========================================
+// VENDOR: WhatsApp taps over the last 7 and 30 days
+// ==========================================
+exports.getWhatsAppAnalytics = async (req, res) => {
+  try {
+    const store = await Store.findOne({ vendor: getVendorId(req) }).select('_id');
+    if (!store) {
+      return res.status(200).json({ status: 'success', data: { last7Days: 0, last30Days: 0, daily: [] } });
+    }
+
+    const dayMs = 24 * 60 * 60 * 1000;
+    const since30 = dayKey(new Date(Date.now() - 29 * dayMs));
+    const since7 = dayKey(new Date(Date.now() - 6 * dayMs));
+
+    const rows = await WhatsAppStat.aggregate([
+      { $match: { store: store._id, day: { $gte: since30 } } },
+      { $group: { _id: '$day', clicks: { $sum: '$clicks' } } },
+      { $sort: { _id: 1 } },
+    ]);
+
+    const daily = rows.map((r) => ({ day: r._id, clicks: r.clicks }));
+    const sum = (list) => list.reduce((total, d) => total + d.clicks, 0);
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        last7Days: sum(daily.filter((d) => d.day >= since7)),
+        last30Days: sum(daily),
+        daily,
+      },
+    });
+  } catch (error) {
+    console.error('WhatsApp analytics error:', error);
+    res.status(500).json({ error: 'Server error loading analytics.' });
   }
 };
