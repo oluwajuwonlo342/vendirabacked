@@ -8,6 +8,7 @@ const Category = require('../models/Category');
 const User = require('../models/User');
 const sendEmail = require('../utils/sendEmail');
 const { normalizeWhatsapp: toDigits, WHATSAPP_HELP } = require('../utils/whatsapp');
+const { normalizeMapLink, MAP_LINK_HELP } = require('../utils/maps');
 const DAY = 24 * 60 * 60 * 1000;
 const MAX_REMINDERS = 2;
 const REMINDERS_PER_RUN = 50;
@@ -208,6 +209,17 @@ exports.saveStore = async (req, res) => {
     for (const key of ['state', 'city', 'address']) {
       if (b[key] !== undefined) store.set(`location.${key}`, clean(b[key], key === 'address' ? 200 : 60));
     }
+    if (b.hasPhysicalStore !== undefined) {
+  store.hasPhysicalStore = b.hasPhysicalStore === true || b.hasPhysicalStore === 'true';
+}
+if (b.mapLink !== undefined) {
+  const link = normalizeMapLink(b.mapLink);
+  if (link === null) throw new InputError(MAP_LINK_HELP);
+  store.mapLink = link;
+}
+if ((b.hasPhysicalStore !== undefined || b.address !== undefined) && store.hasPhysicalStore && !store.location?.address?.trim()) {
+  throw new InputError('Add your shop address so customers can find you, or switch off "I have a physical shop".');
+}
     for (const key of ['instagram', 'facebook', 'tiktok', 'twitter', 'website']) {
       if (b[key] !== undefined) store.set(`socialLinks.${key}`, normalizeSocial(key, b[key]));
     }
