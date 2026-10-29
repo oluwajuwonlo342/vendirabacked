@@ -53,6 +53,8 @@ socialLinks: {
   twitter: String,
   website: String,
 },
+  hasPhysicalStore: { type: Boolean, default: false },
+mapLink: { type: String, trim: true, maxlength: 500 }, // optional Google Maps share link
 // Stores created before this feature have no value, so everything below treats "not false" as live
 isPublished: { type: Boolean, default: true },
 publishedAt: { type: Date },
