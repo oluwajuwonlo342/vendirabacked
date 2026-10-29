@@ -2,6 +2,7 @@ const Store = require('../models/Store');
 const slugify = require('slugify');
 const cloudinary = require('cloudinary').v2;
 const { normalizeWhatsapp, WHATSAPP_HELP } = require('../utils/whatsapp');
+const { normalizeMapLink, MAP_LINK_HELP } = require('../utils/maps');
 
 const CURRENCIES = ['NGN', 'GHS', 'KES', 'ZAR', 'UGX', 'TZS', 'USD', 'GBP', 'EUR'];
 const CTA_MODES = ['order', 'enquire'];
@@ -13,9 +14,17 @@ const formatStoreResponse = (store, { publicView = false } = {}) => {
   const storeObj = store.toObject ? store.toObject() : store;
   storeObj.name = storeObj.businessName;
   // The number the WhatsApp link needs, or null if the saved number can't work.
-  // Computed on every read, so numbers saved before this change (08012345678) still produce working links.
   storeObj.whatsappDigits = normalizeWhatsapp(storeObj.whatsappNumber);
-  if (publicView) delete storeObj.vendor; // customers don't need the owner's account ID
+
+  if (publicView) {
+    delete storeObj.vendor; // customers don't need the owner's account ID
+    // Street address and map link are only public for vendors who run a physical shop.
+    // Everyone else shows just city and state.
+    if (!storeObj.hasPhysicalStore) {
+      if (storeObj.location) delete storeObj.location.address;
+      delete storeObj.mapLink;
+    }
+  }
   return storeObj;
 };
 
@@ -46,6 +55,8 @@ const removeOldImage = async (image) => {
 const discardUploads = (req) =>
   Promise.all(Object.values(req.files || {}).flat().map((f) => removeOldImage({ public_id: f.filename })));
 
+const toBool = (value) => value === true || value === 'true';
+
 // Reads the currency and WhatsApp button settings. Only fields that were sent are returned.
 const readSettings = (body) => {
   const data = {};
@@ -59,6 +70,34 @@ const readSettings = (body) => {
     const cta = String(body.whatsappCta).trim();
     if (!CTA_MODES.includes(cta)) return { error: 'Choose "Order" or "Enquire" for the WhatsApp button.' };
     data.whatsappCta = cta;
+  }
+  return { data };
+};
+
+// Reads the location fields. Dotted keys work with $set and with Store.create.
+const readLocation = (body, existing) => {
+  const data = {};
+
+  for (const key of ['state', 'city', 'address']) {
+    if (body[key] !== undefined) {
+      data[`location.${key}`] = String(body[key]).trim().slice(0, key === 'address' ? 200 : 60);
+    }
+  }
+  if (body.hasPhysicalStore !== undefined) data.hasPhysicalStore = toBool(body.hasPhysicalStore);
+
+  if (body.mapLink !== undefined) {
+    const link = normalizeMapLink(body.mapLink);
+    if (link === null) return { error: MAP_LINK_HELP };
+    data.mapLink = link;
+  }
+
+  // A physical shop needs an address, otherwise customers have nothing to find
+  if (data.hasPhysicalStore !== undefined || data['location.address'] !== undefined) {
+    const physical = data.hasPhysicalStore ?? existing?.hasPhysicalStore ?? false;
+    const address = data['location.address'] ?? existing?.location?.address ?? '';
+    if (physical && !String(address).trim()) {
+      return { error: 'Add your shop address so customers can find you, or switch off "I have a physical shop".' };
+    }
   }
   return { data };
 };
@@ -85,6 +124,9 @@ exports.createStore = async (req, res) => {
     const settings = readSettings(req.body);
     if (settings.error) return fail(400, settings.error);
 
+    const location = readLocation(req.body, null);
+    if (location.error) return fail(400, location.error);
+
     const slug = slugify(String(req.body.slug || name), { lower: true, strict: true });
     if (!slug) return fail(400, 'Choose a store URL using letters or numbers.');
 
@@ -99,6 +141,7 @@ exports.createStore = async (req, res) => {
       vendor: vendorId,
       isPublished: false, // customers can't see it until the vendor publishes from Store Setup
       ...settings.data,
+      ...location.data,
       ...extractImages(req),
     });
 
@@ -156,6 +199,10 @@ exports.updateMyStore = async (req, res) => {
     const settings = readSettings(req.body);
     if (settings.error) return fail(400, settings.error);
     Object.assign(updateData, settings.data);
+
+    const location = readLocation(req.body, existing);
+    if (location.error) return fail(400, location.error);
+    Object.assign(updateData, location.data);
 
     const images = extractImages(req);
     Object.assign(updateData, images);
