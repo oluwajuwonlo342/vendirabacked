@@ -48,5 +48,6 @@ router.post('/', productUploads, productController.createProduct);
 router.get('/', productController.getVendorProducts);
 router.put('/:productId', productUploads, productController.updateProduct);
 router.delete('/:productId', productController.deleteProduct);
-
+router.put('/:productId/reviews/:reviewId/reply', productController.replyToReview);
+router.delete('/:productId/reviews/:reviewId/reply', productController.deleteReviewReply);
 module.exports = router;
