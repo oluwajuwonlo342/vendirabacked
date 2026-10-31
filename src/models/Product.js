@@ -47,14 +47,18 @@ const productSchema = new mongoose.Schema({
   }],
 
   // Reviews
-  reviews: [
-    {
-      customerName: { type: String, required: true },
-      rating: { type: Number, required: true, min: 1, max: 5 },
-      comment: { type: String, required: true },
-      createdAt: { type: Date, default: Date.now }
-    }
-  ],
+reviews: [
+  {
+    customerName: { type: String, required: true },
+    rating: { type: Number, required: true, min: 1, max: 5 },
+    comment: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now },
+    reply: {
+      message: { type: String, trim: true, maxlength: 1000 },
+      repliedAt: { type: Date },
+    },
+  },
+],
   averageRating: { type: Number, default: 0 },
   totalReviews: { type: Number, default: 0 },
 
