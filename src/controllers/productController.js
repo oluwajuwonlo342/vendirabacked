@@ -482,3 +482,64 @@ exports.getWhatsAppAnalytics = async (req, res) => {
     res.status(500).json({ error: 'Server error loading analytics.' });
   }
 };
+
+
+// ==========================================
+// VENDOR: Reply to a customer review (or edit your reply)
+// ==========================================
+exports.replyToReview = async (req, res) => {
+  try {
+    const vendorId = getVendorId(req);
+    const { productId, reviewId } = req.params;
+
+    if (!isValidId(productId) || !isValidId(reviewId)) {
+      return res.status(400).json({ error: 'Invalid review.' });
+    }
+
+    const message = String(req.body.message ?? '').trim();
+    if (!message) return res.status(400).json({ error: 'Write a reply first.' });
+    if (message.length > 1000) {
+      return res.status(400).json({ error: 'Your reply is too long (maximum 1000 characters).' });
+    }
+
+    // Only the product's owner can reply. The positional update touches just this review.
+    const product = await Product.findOneAndUpdate(
+      { _id: productId, vendor: vendorId, 'reviews._id': reviewId },
+      { $set: { 'reviews.$.reply': { message, repliedAt: new Date() } } },
+      { new: true }
+    );
+    if (!product) return res.status(404).json({ error: 'Review not found.' });
+
+    const review = product.reviews.id(reviewId);
+    res.status(200).json({ status: 'success', data: { review: review.toObject() } });
+  } catch (error) {
+    console.error('Reply To Review Error:', error);
+    res.status(500).json({ error: 'Server error saving your reply.' });
+  }
+};
+
+// ==========================================
+// VENDOR: Delete your reply
+// ==========================================
+exports.deleteReviewReply = async (req, res) => {
+  try {
+    const vendorId = getVendorId(req);
+    const { productId, reviewId } = req.params;
+
+    if (!isValidId(productId) || !isValidId(reviewId)) {
+      return res.status(400).json({ error: 'Invalid review.' });
+    }
+
+    const product = await Product.findOneAndUpdate(
+      { _id: productId, vendor: vendorId, 'reviews._id': reviewId },
+      { $unset: { 'reviews.$.reply': '' } },
+      { new: true }
+    );
+    if (!product) return res.status(404).json({ error: 'Review not found.' });
+
+    res.status(200).json({ status: 'success', data: { review: product.reviews.id(reviewId).toObject() } });
+  } catch (error) {
+    console.error('Delete Review Reply Error:', error);
+    res.status(500).json({ error: 'Server error deleting your reply.' });
+  }
+};
