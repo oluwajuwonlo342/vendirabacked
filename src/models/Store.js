@@ -12,6 +12,7 @@ const storeSchema = new mongoose.Schema({
   
   // Categories the store operates in (Supports multiple)
   categories: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Category' }],
+shortCode: { type: String, lowercase: true, trim: true, unique: true, sparse: true, maxlength: 24 },
   
   // Contact & Delivery
   whatsappNumber: { type: String, required: true }, // Crucial for platform functionality
