@@ -6,6 +6,7 @@ const { normalizeMapLink, MAP_LINK_HELP } = require('../utils/maps');
 
 const CURRENCIES = ['NGN', 'GHS', 'KES', 'ZAR', 'UGX', 'TZS', 'USD', 'GBP', 'EUR'];
 const CTA_MODES = ['order', 'enquire'];
+const { parseShortCode } = require('../utils/shortCode');
 
 // Stores an admin has suspended or banned never appear publicly
 const HIDDEN_STATUSES = ['suspended', 'banned'];
@@ -259,5 +260,98 @@ exports.getStoreBySlug = async (req, res) => {
   } catch (error) {
     console.error('Fetch Store By Slug Error:', error);
     res.status(500).json({ error: 'Server error fetching store profile' });
+  }
+};
+
+// ==========================================
+// PUBLIC: Resolve a short link to its store
+// ==========================================
+exports.resolveShortCode = async (req, res) => {
+  try {
+    const parsed = parseShortCode(req.params.code);
+    if (parsed.error) return res.status(404).json({ error: 'Store not found' });
+
+    const store = await Store.findOne({
+      shortCode: parsed.code,
+      isPublished: { $ne: false },
+      status: { $nin: HIDDEN_STATUSES },
+    }).select('slug');
+
+    if (!store) return res.status(404).json({ error: 'Store not found' });
+    res.status(200).json({ status: 'success', data: { slug: store.slug } });
+  } catch (error) {
+    console.error('Resolve Short Code Error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// ==========================================
+// VENDOR: Is this short name free?
+// ==========================================
+exports.checkShortCode = async (req, res) => {
+  try {
+    const mine = await Store.findOne({ vendor: getVendorId(req) }).select('shortCode');
+    if (!mine) return res.status(404).json({ error: 'Create your store first.' });
+
+    const parsed = parseShortCode(req.query.code);
+    if (parsed.error) {
+      return res.status(200).json({
+        status: 'success',
+        data: { available: false, reason: parsed.reason, message: parsed.error },
+      });
+    }
+
+    if (mine.shortCode === parsed.code) {
+      return res.status(200).json({ status: 'success', data: { available: true, reason: 'yours' } });
+    }
+
+    const taken = await Store.exists({ shortCode: parsed.code });
+    res.status(200).json({
+      status: 'success',
+      data: taken
+        ? { available: false, reason: 'taken', message: 'Someone is already using that name.' }
+        : { available: true },
+    });
+  } catch (error) {
+    console.error('Check Short Code Error:', error);
+    res.status(500).json({ error: 'Server error checking that name.' });
+  }
+};
+
+// ==========================================
+// VENDOR: Set or remove the short link
+// ==========================================
+exports.setShortCode = async (req, res) => {
+  try {
+    const store = await Store.findOne({ vendor: getVendorId(req) }).select('_id');
+    if (!store) return res.status(404).json({ error: 'Create your store first.' });
+
+    const raw = String(req.body.shortCode ?? '').trim();
+
+    // An empty value removes the short link
+    if (!raw) {
+      const cleared = await Store.findByIdAndUpdate(store._id, { $unset: { shortCode: 1 } }, { new: true });
+      return res.status(200).json({ status: 'success', data: { store: formatStoreResponse(cleared) } });
+    }
+
+    const parsed = parseShortCode(raw);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const clash = await Store.exists({ shortCode: parsed.code, _id: { $ne: store._id } });
+    if (clash) return res.status(409).json({ error: 'Someone is already using that name. Try another.' });
+
+    const updated = await Store.findByIdAndUpdate(
+      store._id,
+      { $set: { shortCode: parsed.code } },
+      { new: true, runValidators: true }
+    );
+    res.status(200).json({ status: 'success', data: { store: formatStoreResponse(updated) } });
+  } catch (error) {
+    console.error('Set Short Code Error:', error);
+    if (error.code === 11000) return res.status(409).json({ error: 'Someone just took that name. Try another.' });
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ error: Object.values(error.errors)[0].message });
+    }
+    res.status(500).json({ error: 'Server error saving your short link.' });
   }
 };
