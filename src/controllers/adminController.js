@@ -140,18 +140,22 @@ exports.deleteUser = async (req, res) => {
 // @access  Private/Admin
 exports.getAllStores = async (req, res) => {
   try {
-    const [stores, counts] = await Promise.all([
+    const [stores, totals] = await Promise.all([
       Store.find()
         .populate('vendor', 'name email')
         .sort({ createdAt: -1 })
         .lean(),
-      // One query counts the products of every store
-      Product.aggregate([{ $group: { _id: '$store', count: { $sum: 1 } } }]),
+      // One query gives every store's product count and total product views
+      Product.aggregate([
+        { $group: { _id: '$store', count: { $sum: 1 }, views: { $sum: '$views' } } },
+      ]),
     ]);
 
-    const countByStore = Object.fromEntries(counts.map((c) => [String(c._id), c.count]));
+    const totalsByStore = Object.fromEntries(totals.map((t) => [String(t._id), t]));
     stores.forEach((s) => {
-      s.productCount = countByStore[String(s._id)] || 0; // 0 for stores with no products
+      const t = totalsByStore[String(s._id)];
+      s.productCount = t?.count || 0; // 0 for stores with no products
+      s.viewCount = t?.views || 0;
     });
 
     res.status(200).json({ success: true, count: stores.length, data: stores });
@@ -160,7 +164,6 @@ exports.getAllStores = async (req, res) => {
     res.status(500).json({ success: false, error: 'Server error fetching stores.' });
   }
 };
-
 // @desc    Get platform settings
 // @route   GET /api/admin/settings
 // @access  Private/Admin
