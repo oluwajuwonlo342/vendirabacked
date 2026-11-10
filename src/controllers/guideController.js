@@ -1,19 +1,41 @@
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const cloudinary = require('cloudinary').v2;
 const Tutorial = require('../models/Tutorial');
 const WelcomeMessage = require('../models/WelcomeMessage');
+const EmailTemplate = require('../models/EmailTemplate');
+const EmailSend = require('../models/EmailSend');
 const User = require('../models/User');
+const Store = require('../models/Store');
+const Product = require('../models/Product');
 const sendEmail = require('../utils/sendEmail');
 
-const getUserId = (req) => req.user?._id || req.user?.id || req.userId || req.user;
-const VENDOR_FILTER = { role: { $nin: ['ADMIN', 'admin'] } };
+const DAY = 24 * 60 * 60 * 1000;
 const BATCH_LIMIT = 250; // Brevo's free plan allows about 300 emails a day
+const VENDOR_FILTER = { role: { $nin: ['ADMIN', 'admin'] } };
+const AUDIENCES = ['latest', 'recent', 'all', 'no-store', 'no-product'];
 
+// ---------- small helpers ----------
+const getUserId = (req) => req.user?._id || req.user?.id || req.userId || req.user;
+const readBool = (value) => (value === undefined ? undefined : value === true || value === 'true');
+const clampInt = (value, min, max, fallback) => {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) ? Math.min(Math.max(n, min), max) : fallback;
+};
 const escapeHtml = (s = '') =>
   String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const clientBase = () => (process.env.CLIENT_URL || '').split(',')[0].trim().replace(/\/$/, '');
+const apiBase = () => (process.env.API_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
 const personalise = (text = '', name) => text.replace(/\{\{\s*name\s*\}\}/gi, name || 'there');
 const isHttps = (u) => { try { return new URL(u).protocol === 'https:'; } catch { return false; } };
+const unsubToken = (userId) =>
+  crypto.createHmac('sha256', process.env.JWT_SECRET || '').update(String(userId)).digest('hex');
+
+const inChunks = async (items, size, fn) => {
+  for (let i = 0; i < items.length; i += size) {
+    await Promise.all(items.slice(i, i + size).map(fn));
+  }
+};
 
 const getWelcome = () =>
   WelcomeMessage.findOneAndUpdate(
@@ -21,6 +43,15 @@ const getWelcome = () =>
     { $setOnInsert: { key: 'default' } },
     { new: true, upsert: true, setDefaultsOnInsert: true }
   );
+
+const getTutorialTitles = async (limit = 8) => {
+  const rows = await Tutorial.find({ isPublished: true })
+    .sort({ order: 1, createdAt: 1 })
+    .select('title')
+    .limit(limit)
+    .lean();
+  return rows.map((r) => r.title);
+};
 
 const destroyVideo = async (publicId) => {
   if (!publicId) return;
@@ -30,83 +61,165 @@ const destroyVideo = async (publicId) => {
     console.error('Cloudinary cleanup failed:', err.message);
   }
 };
-
-// Multer uploads before the controller runs, so rejected requests must delete their fresh upload
 const discardUpload = (req) => (req.file ? destroyVideo(req.file.filename) : null);
 
-const inChunks = async (items, size, fn) => {
-  for (let i = 0; i < items.length; i += size) {
-    await Promise.all(items.slice(i, i + size).map(fn));
+// ---------- templates: the welcome email and your own ----------
+const welcomeTemplate = (welcome) => ({
+  key: 'welcome',
+  kind: 'welcome',
+  name: 'Welcome email',
+  subject: welcome.subject,
+  message: welcome.message,
+  includeTutorials: welcome.includeTutorialsOnRegister !== false,
+  button: null,
+});
+
+const customTemplate = (doc) => ({
+  key: String(doc._id),
+  kind: 'custom',
+  name: doc.name,
+  subject: doc.subject,
+  message: doc.message,
+  includeTutorials: Boolean(doc.includeTutorials),
+  button: doc.buttonLabel && doc.buttonUrl ? { label: doc.buttonLabel, url: doc.buttonUrl } : null,
+});
+
+const loadTemplate = async (id) => {
+  if (!id || id === 'welcome') return welcomeTemplate(await getWelcome());
+  if (!mongoose.Types.ObjectId.isValid(id)) return null;
+  const doc = await EmailTemplate.findById(id).lean();
+  return doc ? customTemplate(doc) : null;
+};
+
+// ---------- building and sending an email ----------
+const buildEmail = (tpl, user, tutorialTitles) => {
+  const hasTutorials = tutorialTitles.length > 0;
+  const guideLink = `${clientBase()}/dashboard/guide`;
+
+  let button = null;
+  if (tpl.button) {
+    button = {
+      label: tpl.button.label,
+      url: tpl.button.url.startsWith('/') ? `${clientBase()}${tpl.button.url}` : tpl.button.url,
+    };
+  } else if (hasTutorials) {
+    button = { label: 'Watch the tutorials', url: guideLink };
+  } else if (tpl.kind === 'welcome') {
+    button = { label: 'Go to my dashboard', url: `${clientBase()}/dashboard` };
+  }
+
+  // When the button goes somewhere else, still give a plain link to the tutorials
+  const showGuideLine = hasTutorials && button && button.url !== guideLink;
+  const subject = personalise(tpl.subject, user.name);
+  const body = personalise(tpl.message, user.name);
+
+  // Announcements carry a one-click opt-out. The welcome email is a one-off and doesn't need it.
+  const unsubscribe =
+    tpl.kind === 'custom' ? `${apiBase()}/api/onboarding/unsubscribe?u=${user._id}&t=${unsubToken(user._id)}` : '';
+
+  const listText = hasTutorials ? `\n\nWhat you'll learn:\n${tutorialTitles.map((t) => `- ${t}`).join('\n')}` : '';
+  const text = [
+    `${body}${listText}`,
+    button ? `${button.label}: ${button.url}` : '',
+    showGuideLine ? `Watch the tutorials: ${guideLink}` : '',
+    unsubscribe ? `Stop these emails: ${unsubscribe}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const listHtml = hasTutorials
+    ? `<p style="margin:20px 0 6px;font-weight:bold">What you'll learn:</p><ul style="padding-left:20px;margin:0">${tutorialTitles
+        .map((t) => `<li style="margin:4px 0">${escapeHtml(t)}</li>`)
+        .join('')}</ul>`
+    : '';
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;color:#111827;line-height:1.55">
+      <h2 style="color:#128C7E">${escapeHtml(subject)}</h2>
+      <p>${escapeHtml(body).replace(/\n/g, '<br>')}</p>
+      ${listHtml}
+      ${button ? `<p style="margin:28px 0"><a href="${escapeHtml(button.url)}" style="background:#128C7E;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">${escapeHtml(button.label)}</a></p>` : ''}
+      ${showGuideLine ? `<p style="font-size:13px;color:#6b7280">Tutorial videos: <a href="${guideLink}" style="color:#128C7E">${guideLink}</a></p>` : ''}
+      ${unsubscribe ? `<p style="font-size:12px;color:#6b7280;margin-top:24px">You get this because you have a Vendira account. <a href="${unsubscribe}" style="color:#6b7280">Stop these emails</a>.</p>` : ''}
+    </div>`;
+
+  return { subject, text, html };
+};
+
+// record: false for test emails, so a test never counts as "sent"
+const deliver = async (user, tpl, { tutorialTitles = [], record = true } = {}) => {
+  await sendEmail({ to: user.email, ...buildEmail(tpl, user, tutorialTitles) });
+  if (!record) return;
+
+  if (tpl.kind === 'welcome') {
+    await User.updateOne({ _id: user._id }, { welcomeEmailSentAt: new Date() });
+  } else {
+    await EmailSend.updateOne({ templateKey: tpl.key, user: user._id }, { $set: { sentAt: new Date() } }, { upsert: true });
   }
 };
-const DAY = 24 * 60 * 60 * 1000;
-const NEW_DAYS = 7;
 
-const readBool = (value) =>
-  value === undefined ? undefined : value === true || value === 'true';
-
-// Which vendors each audience means
-const audienceFilter = (audience) => {
-  if (audience === 'all') {
-    // Skips anyone emailed in the last 24 hours, so each click reaches the next batch
-    return {
-      ...VENDOR_FILTER,
-      $or: [{ welcomeEmailSentAt: null }, { welcomeEmailSentAt: { $lt: new Date(Date.now() - DAY) } }],
-    };
-  }
-  if (audience === 'new') {
-    return {
-      ...VENDOR_FILTER,
-      welcomeEmailSentAt: null,
-      createdAt: { $gte: new Date(Date.now() - NEW_DAYS * DAY) },
-    };
-  }
-  return { ...VENDOR_FILTER, welcomeEmailSentAt: null }; // 'pending'
-};
+// Used by registerVendor: honours the "send automatically" switch
 const sendWelcomeEmail = async (user, { force = false, markSent = true, includeTutorials } = {}) => {
   const welcome = await getWelcome();
   if (!force && !welcome.sendOnRegister) return false;
 
-  const wantTutorials =
-    includeTutorials === undefined ? welcome.includeTutorialsOnRegister !== false : Boolean(includeTutorials);
-
-  const tutorials = wantTutorials
-    ? await Tutorial.find({ isPublished: true }).sort({ order: 1, createdAt: 1 }).select('title').limit(8)
-    : [];
-  const hasTutorials = tutorials.length > 0;
-
-  // Only point at the tutorials page when there is something on it
-  const link = `${clientBase()}${hasTutorials ? '/dashboard/guide' : '/dashboard'}`;
-  const cta = hasTutorials ? 'Watch the tutorials' : 'Go to my dashboard';
-
-  const message = personalise(welcome.message, user.name);
-  const listHtml = hasTutorials
-    ? `<p style="margin:20px 0 6px;font-weight:bold">What you'll learn:</p><ul style="padding-left:20px;margin:0">${tutorials
-        .map((t) => `<li style="margin:4px 0">${escapeHtml(t.title)}</li>`)
-        .join('')}</ul>`
-    : '';
-  const listText = hasTutorials ? `\n\nWhat you'll learn:\n${tutorials.map((t) => `- ${t.title}`).join('\n')}` : '';
-
-  await sendEmail({
-    to: user.email,
-    subject: welcome.subject,
-    text: `${message}${listText}\n\n${cta}: ${link}`,
-    html: `
-      <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;color:#111827;line-height:1.55">
-        <h2 style="color:#128C7E">${escapeHtml(welcome.subject)}</h2>
-        <p>${escapeHtml(message).replace(/\n/g, '<br>')}</p>
-        ${listHtml}
-        <p style="margin:28px 0">
-          <a href="${link}" style="background:#128C7E;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">${cta}</a>
-        </p>
-        <p style="font-size:13px;color:#6b7280">Or open this link: ${link}</p>
-      </div>`,
-  });
-
-  if (markSent) await User.updateOne({ _id: user._id }, { welcomeEmailSentAt: new Date() });
+  const tpl = welcomeTemplate(welcome);
+  const want = includeTutorials === undefined ? tpl.includeTutorials : Boolean(includeTutorials);
+  await deliver(user, tpl, { tutorialTitles: want ? await getTutorialTitles() : [], record: markSent });
   return true;
 };
 exports.sendWelcomeEmail = sendWelcomeEmail;
+
+// ---------- who gets a message ----------
+const readAudience = (body) => ({
+  audience: AUDIENCES.includes(body.audience) ? body.audience : 'latest',
+  count: clampInt(body.count, 1, BATCH_LIMIT, 5),
+  days: clampInt(body.days, 1, 90, 7),
+  skipAlreadySent: readBool(body.skipAlreadySent) !== false,
+});
+
+// Everyone who already got this template. With "skip" off, only people emailed in the last 24 hours,
+// which protects against double clicks and lets big sends continue in batches.
+const alreadySentSet = async (templateKey, skipAlreadySent) => {
+  const since = new Date(Date.now() - DAY);
+  const ids =
+    templateKey === 'welcome'
+      ? await User.distinct('_id', { welcomeEmailSentAt: skipAlreadySent ? { $ne: null } : { $gte: since } })
+      : await EmailSend.distinct('user', skipAlreadySent ? { templateKey } : { templateKey, sentAt: { $gte: since } });
+  return new Set(ids.map(String));
+};
+
+const resolveAudience = async (tpl, { audience, count, days, skipAlreadySent }) => {
+  const filter = { ...VENDOR_FILTER };
+  let sort = { createdAt: 1 };
+  let limit = 5000;
+
+  if (audience === 'latest') {
+    sort = { createdAt: -1 };
+    limit = count; // the newest N sign-ups, chosen BEFORE removing anyone who already got it
+  } else if (audience === 'recent') {
+    filter.createdAt = { $gte: new Date(Date.now() - days * DAY) };
+  } else if (audience === 'no-store') {
+    filter._id = { $nin: await Store.distinct('vendor') };
+  } else if (audience === 'no-product') {
+    filter._id = { $in: await Store.distinct('vendor'), $nin: await Product.distinct('vendor') };
+  }
+
+  const segment = await User.find(filter).select('name email remindersOptOut').sort(sort).limit(limit).lean();
+  const sentSet = await alreadySentSet(tpl.key, skipAlreadySent);
+
+  const recipients = [];
+  let alreadySent = 0;
+  let optedOut = 0;
+  for (const user of segment) {
+    if (!user.email) continue;
+    if (tpl.kind === 'custom' && user.remindersOptOut) { optedOut += 1; continue; }
+    if (sentSet.has(String(user._id))) { alreadySent += 1; continue; }
+    recipients.push(user);
+  }
+  return { total: segment.length, alreadySent, optedOut, recipients };
+};
+
 // ==========================================
 // VENDOR: welcome message + published tutorials
 // ==========================================
@@ -131,19 +244,20 @@ exports.getGuide = async (req, res) => {
   }
 };
 
-
 // ==========================================
-// ADMIN: everything + stats
+// ADMIN: everything the page needs
 // ==========================================
 exports.getAdminGuide = async (req, res) => {
   try {
-    const [welcome, tutorials, vendors, pending, newPending] = await Promise.all([
+    const [welcome, templates, tutorials, vendors, welcomeNotSent, sentCounts] = await Promise.all([
       getWelcome(),
+      EmailTemplate.find().sort({ createdAt: -1 }).lean(),
       Tutorial.find().sort({ order: 1, createdAt: 1 }),
       User.countDocuments(VENDOR_FILTER),
-      User.countDocuments(audienceFilter('pending')),
-      User.countDocuments(audienceFilter('new')),
+      User.countDocuments({ ...VENDOR_FILTER, welcomeEmailSentAt: null }),
+      EmailSend.aggregate([{ $group: { _id: '$templateKey', n: { $sum: 1 } } }]),
     ]);
+    const sentBy = Object.fromEntries(sentCounts.map((c) => [c._id, c.n]));
 
     res.status(200).json({
       status: 'success',
@@ -154,13 +268,13 @@ exports.getAdminGuide = async (req, res) => {
           sendOnRegister: welcome.sendOnRegister,
           includeTutorialsOnRegister: welcome.includeTutorialsOnRegister !== false,
         },
+        templates: templates.map((t) => ({ ...t, sentCount: sentBy[String(t._id)] || 0 })),
         tutorials,
         stats: {
           vendors,
-          pending,
-          newPending,
-          newDays: NEW_DAYS,
+          welcomeNotSent,
           publishedTutorials: tutorials.filter((t) => t.isPublished).length,
+          batchLimit: BATCH_LIMIT,
         },
       },
     });
@@ -171,7 +285,7 @@ exports.getAdminGuide = async (req, res) => {
 };
 
 // ==========================================
-// ADMIN: edit the welcome message and signup settings
+// ADMIN: the welcome email and its automatic sending
 // ==========================================
 exports.updateWelcome = async (req, res) => {
   try {
@@ -198,55 +312,161 @@ exports.updateWelcome = async (req, res) => {
 };
 
 // ==========================================
-// ADMIN: preview email sent to yourself
+// ADMIN: your own message templates
+// ==========================================
+const readTemplate = (b) => {
+  const name = String(b.name ?? '').trim();
+  const subject = String(b.subject ?? '').trim();
+  const message = String(b.message ?? '').trim();
+  const buttonLabel = String(b.buttonLabel ?? '').trim();
+  const buttonUrl = String(b.buttonUrl ?? '').trim();
+
+  if (!name) return { error: 'Give the template a name.' };
+  if (name.length > 80) return { error: 'The name is too long (maximum 80 characters).' };
+  if (!subject) return { error: 'The email needs a subject.' };
+  if (subject.length > 150) return { error: 'Subject is too long (maximum 150 characters).' };
+  if (!message) return { error: 'Write the message.' };
+  if (message.length > 3000) return { error: 'Message is too long (maximum 3000 characters).' };
+  if (Boolean(buttonLabel) !== Boolean(buttonUrl)) {
+    return { error: 'Add both a button label and a button link, or leave both empty.' };
+  }
+  if (buttonLabel.length > 40) return { error: 'The button label is too long (maximum 40 characters).' };
+  if (buttonUrl && !(isHttps(buttonUrl) || /^\/(?!\/)/.test(buttonUrl))) {
+    return { error: 'The button link must start with https:// or with / (for a page in the app, like /dashboard/products).' };
+  }
+
+  return {
+    data: { name, subject, message, buttonLabel, buttonUrl, includeTutorials: readBool(b.includeTutorials) === true },
+  };
+};
+
+exports.createTemplate = async (req, res) => {
+  try {
+    const parsed = readTemplate(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const template = await EmailTemplate.create(parsed.data);
+    res.status(201).json({ status: 'success', data: { template: { ...template.toObject(), sentCount: 0 } } });
+  } catch (error) {
+    console.error('Create Template Error:', error);
+    res.status(500).json({ error: 'Server error saving the template.' });
+  }
+};
+
+exports.updateTemplate = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid template ID.' });
+
+    const parsed = readTemplate(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const template = await EmailTemplate.findByIdAndUpdate(id, { $set: parsed.data }, { new: true, runValidators: true });
+    if (!template) return res.status(404).json({ error: 'Template not found.' });
+
+    const sentCount = await EmailSend.countDocuments({ templateKey: String(id) });
+    res.status(200).json({ status: 'success', data: { template: { ...template.toObject(), sentCount } } });
+  } catch (error) {
+    console.error('Update Template Error:', error);
+    res.status(500).json({ error: 'Server error saving the template.' });
+  }
+};
+
+exports.deleteTemplate = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid template ID.' });
+
+    const template = await EmailTemplate.findByIdAndDelete(id);
+    if (!template) return res.status(404).json({ error: 'Template not found.' });
+
+    await EmailSend.deleteMany({ templateKey: String(id) });
+    res.status(200).json({ status: 'success', message: 'Template deleted.' });
+  } catch (error) {
+    console.error('Delete Template Error:', error);
+    res.status(500).json({ error: 'Server error deleting the template.' });
+  }
+};
+
+// ==========================================
+// ADMIN: how many people would get this message?
+// ==========================================
+exports.previewAudience = async (req, res) => {
+  try {
+    const tpl = await loadTemplate(req.body.template);
+    if (!tpl) return res.status(404).json({ error: 'That template no longer exists.' });
+
+    const { total, alreadySent, optedOut, recipients } = await resolveAudience(tpl, readAudience(req.body));
+    res.status(200).json({
+      status: 'success',
+      data: {
+        total,
+        alreadySent,
+        optedOut,
+        eligible: recipients.length,
+        willSend: Math.min(recipients.length, BATCH_LIMIT),
+        batchLimit: BATCH_LIMIT,
+        sample: recipients.slice(0, 3).map((u) => u.name || u.email),
+      },
+    });
+  } catch (error) {
+    console.error('Preview Audience Error:', error);
+    res.status(500).json({ error: 'Server error checking who would receive this.' });
+  }
+};
+
+// ==========================================
+// ADMIN: send a template to yourself first
 // ==========================================
 exports.sendTest = async (req, res) => {
   try {
-    const admin = await User.findById(getUserId(req)).select('name email');
+    const tpl = await loadTemplate(req.body.template);
+    if (!tpl) return res.status(404).json({ error: 'That template no longer exists.' });
+
+    const admin = await User.findById(getUserId(req)).select('name email').lean();
     if (!admin) return res.status(404).json({ error: 'Account not found.' });
 
-    await sendWelcomeEmail(admin, {
-      force: true,
-      markSent: false,
-      includeTutorials: readBool(req.body.includeTutorials),
-    });
+    const want = readBool(req.body.includeTutorials) ?? tpl.includeTutorials;
+    await deliver(admin, tpl, { tutorialTitles: want ? await getTutorialTitles() : [], record: false });
     res.status(200).json({ status: 'success', message: `A test email was sent to ${admin.email}.` });
   } catch (error) {
     console.error('Send Test Error:', error);
     res.status(500).json({ error: `Could not send the test email: ${error.message}` });
   }
-};// ==========================================
-// ADMIN: send the welcome email to vendors
-// audience: 'new' (joined recently), 'pending' (never emailed), 'all' (resend)
-// ==========================================
-exports.sendWelcomeToVendors = async (req, res) => {
-  try {
-    const audience = ['new', 'pending', 'all'].includes(req.body.audience) ? req.body.audience : 'pending';
-    const includeTutorials = readBool(req.body.includeTutorials);
-    const filter = audienceFilter(audience);
+};
 
-    const users = await User.find(filter)
-      .select('name email')
-      .sort({ welcomeEmailSentAt: 1, createdAt: 1 }) // never-emailed first, then the longest ago
-      .limit(BATCH_LIMIT);
+// ==========================================
+// ADMIN: send a template to a group of vendors
+// ==========================================
+exports.sendMessage = async (req, res) => {
+  try {
+    const tpl = await loadTemplate(req.body.template);
+    if (!tpl) return res.status(404).json({ error: 'That template no longer exists.' });
+
+    const { alreadySent, optedOut, recipients } = await resolveAudience(tpl, readAudience(req.body));
+    const batch = recipients.slice(0, BATCH_LIMIT);
+
+    const want = readBool(req.body.includeTutorials) ?? tpl.includeTutorials;
+    const tutorialTitles = want && batch.length ? await getTutorialTitles() : [];
 
     let sent = 0;
     let failed = 0;
-    await inChunks(users, 5, async (user) => {
+    await inChunks(batch, 5, async (user) => {
       try {
-        await sendWelcomeEmail(user, { force: true, includeTutorials });
+        await deliver(user, tpl, { tutorialTitles });
         sent += 1;
       } catch (err) {
         failed += 1;
-        console.error(`Welcome email to ${user.email} failed:`, err.message);
+        console.error(`Email to ${user.email} failed:`, err.message);
       }
     });
 
-    // Anyone just emailed drops out of every audience, so this is what is genuinely left
-    const remaining = await User.countDocuments(filter);
-    res.status(200).json({ status: 'success', data: { sent, failed, remaining, audience } });
+    res.status(200).json({
+      status: 'success',
+      data: { sent, failed, remaining: recipients.length - batch.length, skipped: { alreadySent, optedOut } },
+    });
   } catch (error) {
-    console.error('Send Welcome Error:', error);
+    console.error('Send Message Error:', error);
     res.status(500).json({ error: 'Server error sending emails.' });
   }
 };
