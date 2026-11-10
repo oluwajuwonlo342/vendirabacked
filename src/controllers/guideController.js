@@ -39,39 +39,65 @@ const inChunks = async (items, size, fn) => {
     await Promise.all(items.slice(i, i + size).map(fn));
   }
 };
+const DAY = 24 * 60 * 60 * 1000;
+const NEW_DAYS = 7;
 
-// ==========================================
-// Welcome email (also used by registerVendor)
-// ==========================================
-const sendWelcomeEmail = async (user, { force = false, markSent = true } = {}) => {
+const readBool = (value) =>
+  value === undefined ? undefined : value === true || value === 'true';
+
+// Which vendors each audience means
+const audienceFilter = (audience) => {
+  if (audience === 'all') {
+    // Skips anyone emailed in the last 24 hours, so each click reaches the next batch
+    return {
+      ...VENDOR_FILTER,
+      $or: [{ welcomeEmailSentAt: null }, { welcomeEmailSentAt: { $lt: new Date(Date.now() - DAY) } }],
+    };
+  }
+  if (audience === 'new') {
+    return {
+      ...VENDOR_FILTER,
+      welcomeEmailSentAt: null,
+      createdAt: { $gte: new Date(Date.now() - NEW_DAYS * DAY) },
+    };
+  }
+  return { ...VENDOR_FILTER, welcomeEmailSentAt: null }; // 'pending'
+};
+const sendWelcomeEmail = async (user, { force = false, markSent = true, includeTutorials } = {}) => {
   const welcome = await getWelcome();
   if (!force && !welcome.sendOnRegister) return false;
 
-  const tutorials = await Tutorial.find({ isPublished: true })
-    .sort({ order: 1, createdAt: 1 })
-    .select('title')
-    .limit(8);
+  const wantTutorials =
+    includeTutorials === undefined ? welcome.includeTutorialsOnRegister !== false : Boolean(includeTutorials);
 
-  const link = `${clientBase()}/dashboard/guide`;
+  const tutorials = wantTutorials
+    ? await Tutorial.find({ isPublished: true }).sort({ order: 1, createdAt: 1 }).select('title').limit(8)
+    : [];
+  const hasTutorials = tutorials.length > 0;
+
+  // Only point at the tutorials page when there is something on it
+  const link = `${clientBase()}${hasTutorials ? '/dashboard/guide' : '/dashboard'}`;
+  const cta = hasTutorials ? 'Watch the tutorials' : 'Go to my dashboard';
+
   const message = personalise(welcome.message, user.name);
-  const listHtml = tutorials.length
+  const listHtml = hasTutorials
     ? `<p style="margin:20px 0 6px;font-weight:bold">What you'll learn:</p><ul style="padding-left:20px;margin:0">${tutorials
         .map((t) => `<li style="margin:4px 0">${escapeHtml(t.title)}</li>`)
         .join('')}</ul>`
     : '';
-  const listText = tutorials.length ? `\n\nWhat you'll learn:\n${tutorials.map((t) => `- ${t.title}`).join('\n')}` : '';
+  const listText = hasTutorials ? `\n\nWhat you'll learn:\n${tutorials.map((t) => `- ${t.title}`).join('\n')}` : '';
 
   await sendEmail({
     to: user.email,
     subject: welcome.subject,
-    text: `${message}${listText}\n\nWatch the tutorials: ${link}`,
+    text: `${message}${listText}\n\n${cta}: ${link}`,
     html: `
       <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;color:#111827;line-height:1.55">
         <h2 style="color:#128C7E">${escapeHtml(welcome.subject)}</h2>
         <p>${escapeHtml(message).replace(/\n/g, '<br>')}</p>
         ${listHtml}
         <p style="margin:28px 0">
-          <a href="${link}" style="background:#128C7E;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Watch the tutorials</a>
+          <a href="${link}" style="background:#128C7E;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">${cta}</a>
         </p>
         <p style="font-size:13px;color:#6b7280">Or open this link: ${link}</p>
       </div>`,
@@ -81,7 +107,6 @@ const sendWelcomeEmail = async (user, { force = false, markSent = true } = {}) =
   return true;
 };
 exports.sendWelcomeEmail = sendWelcomeEmail;
-
 // ==========================================
 // VENDOR: welcome message + published tutorials
 // ==========================================
@@ -106,24 +131,37 @@ exports.getGuide = async (req, res) => {
   }
 };
 
+
 // ==========================================
 // ADMIN: everything + stats
 // ==========================================
 exports.getAdminGuide = async (req, res) => {
   try {
-    const [welcome, tutorials, vendors, pending] = await Promise.all([
+    const [welcome, tutorials, vendors, pending, newPending] = await Promise.all([
       getWelcome(),
       Tutorial.find().sort({ order: 1, createdAt: 1 }),
       User.countDocuments(VENDOR_FILTER),
-      User.countDocuments({ ...VENDOR_FILTER, welcomeEmailSentAt: null }),
+      User.countDocuments(audienceFilter('pending')),
+      User.countDocuments(audienceFilter('new')),
     ]);
 
     res.status(200).json({
       status: 'success',
       data: {
-        welcome: { subject: welcome.subject, message: welcome.message, sendOnRegister: welcome.sendOnRegister },
+        welcome: {
+          subject: welcome.subject,
+          message: welcome.message,
+          sendOnRegister: welcome.sendOnRegister,
+          includeTutorialsOnRegister: welcome.includeTutorialsOnRegister !== false,
+        },
         tutorials,
-        stats: { vendors, pending },
+        stats: {
+          vendors,
+          pending,
+          newPending,
+          newDays: NEW_DAYS,
+          publishedTutorials: tutorials.filter((t) => t.isPublished).length,
+        },
       },
     });
   } catch (error) {
@@ -133,7 +171,7 @@ exports.getAdminGuide = async (req, res) => {
 };
 
 // ==========================================
-// ADMIN: edit the welcome message
+// ADMIN: edit the welcome message and signup settings
 // ==========================================
 exports.updateWelcome = async (req, res) => {
   try {
@@ -148,7 +186,8 @@ exports.updateWelcome = async (req, res) => {
     const welcome = await getWelcome();
     welcome.subject = subject;
     welcome.message = message;
-    welcome.sendOnRegister = req.body.sendOnRegister === true || req.body.sendOnRegister === 'true';
+    welcome.sendOnRegister = readBool(req.body.sendOnRegister) === true;
+    welcome.includeTutorialsOnRegister = readBool(req.body.includeTutorialsOnRegister) !== false;
     await welcome.save();
 
     res.status(200).json({ status: 'success', data: { welcome } });
@@ -166,30 +205,36 @@ exports.sendTest = async (req, res) => {
     const admin = await User.findById(getUserId(req)).select('name email');
     if (!admin) return res.status(404).json({ error: 'Account not found.' });
 
-    await sendWelcomeEmail(admin, { force: true, markSent: false });
+    await sendWelcomeEmail(admin, {
+      force: true,
+      markSent: false,
+      includeTutorials: readBool(req.body.includeTutorials),
+    });
     res.status(200).json({ status: 'success', message: `A test email was sent to ${admin.email}.` });
   } catch (error) {
     console.error('Send Test Error:', error);
     res.status(500).json({ error: `Could not send the test email: ${error.message}` });
   }
-};
-
-// ==========================================
-// ADMIN: send the welcome email to existing vendors
+};// ==========================================
+// ADMIN: send the welcome email to vendors
+// audience: 'new' (joined recently), 'pending' (never emailed), 'all' (resend)
 // ==========================================
 exports.sendWelcomeToVendors = async (req, res) => {
   try {
-    const audience = req.body.audience === 'all' ? 'all' : 'pending';
-    const filter = audience === 'all' ? VENDOR_FILTER : { ...VENDOR_FILTER, welcomeEmailSentAt: null };
+    const audience = ['new', 'pending', 'all'].includes(req.body.audience) ? req.body.audience : 'pending';
+    const includeTutorials = readBool(req.body.includeTutorials);
+    const filter = audienceFilter(audience);
 
-    const total = await User.countDocuments(filter);
-    const users = await User.find(filter).select('name email welcomeEmailSentAt').sort({ createdAt: 1 }).limit(BATCH_LIMIT);
+    const users = await User.find(filter)
+      .select('name email')
+      .sort({ welcomeEmailSentAt: 1, createdAt: 1 }) // never-emailed first, then the longest ago
+      .limit(BATCH_LIMIT);
 
     let sent = 0;
     let failed = 0;
     await inChunks(users, 5, async (user) => {
       try {
-        await sendWelcomeEmail(user, { force: true });
+        await sendWelcomeEmail(user, { force: true, includeTutorials });
         sent += 1;
       } catch (err) {
         failed += 1;
@@ -197,9 +242,9 @@ exports.sendWelcomeToVendors = async (req, res) => {
       }
     });
 
-    // "all" re-sends to everyone, so it only reports what was left over after this batch
-    const remaining = audience === 'pending' ? Math.max(total - sent, 0) : Math.max(total - users.length, 0);
-    res.status(200).json({ status: 'success', data: { sent, failed, remaining } });
+    // Anyone just emailed drops out of every audience, so this is what is genuinely left
+    const remaining = await User.countDocuments(filter);
+    res.status(200).json({ status: 'success', data: { sent, failed, remaining, audience } });
   } catch (error) {
     console.error('Send Welcome Error:', error);
     res.status(500).json({ error: 'Server error sending emails.' });
