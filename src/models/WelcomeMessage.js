@@ -10,7 +10,7 @@ const welcomeSchema = new mongoose.Schema({
     maxlength: 3000,
     default:
       "Hi {{name}},\n\nWelcome to Vendira! We're glad you're here. In a few minutes you can have your own online shop that sends orders straight to your WhatsApp.\n\nWatch the short video tutorials to get started. If you get stuck, send us a message from the Feedback page and we'll help.",
-  },
+  },includeTutorialsOnRegister: { type: Boolean, default: true },
   sendOnRegister: { type: Boolean, default: true },
 }, { timestamps: true });
 
