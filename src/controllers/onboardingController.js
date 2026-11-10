@@ -9,6 +9,7 @@ const User = require('../models/User');
 const sendEmail = require('../utils/sendEmail');
 const { normalizeWhatsapp: toDigits, WHATSAPP_HELP } = require('../utils/whatsapp');
 const { normalizeMapLink, MAP_LINK_HELP } = require('../utils/maps');
+
 const DAY = 24 * 60 * 60 * 1000;
 const MAX_REMINDERS = 2;
 const REMINDERS_PER_RUN = 50;
@@ -32,6 +33,7 @@ const destroy = async (publicId) => {
     console.error('Cloudinary cleanup failed:', err.message);
   }
 };
+
 // Multer uploads before the controller runs, so rejected requests must delete their fresh uploads
 const discardUploads = (req) =>
   Promise.all(Object.values(req.files || {}).flat().map((f) => destroy(f.filename)));
@@ -50,7 +52,13 @@ const SOCIAL_BASE = {
   tiktok: 'https://tiktok.com/@',
   twitter: 'https://x.com/',
 };
-const SOCIAL_LABEL = { instagram: 'Instagram', facebook: 'Facebook', tiktok: 'TikTok', twitter: 'X (Twitter)', website: 'website' };
+const SOCIAL_LABEL = {
+  instagram: 'Instagram',
+  facebook: 'Facebook',
+  tiktok: 'TikTok',
+  twitter: 'X (Twitter)',
+  website: 'website',
+};
 
 // Accepts a full link or just a username and always returns a safe https link (or '')
 const normalizeSocial = (key, raw) => {
@@ -110,7 +118,7 @@ const buildChecklist = (store, productCount) => {
 
   return [
     { key: 'name', step: 1, label: 'Name your store', done: Boolean(s?.businessName), required: true },
-  { key: 'whatsapp', step: 1, label: 'Add your WhatsApp number', done: Boolean(toDigits(s?.whatsappNumber)), required: true },
+    { key: 'whatsapp', step: 1, label: 'Add your WhatsApp number', done: Boolean(toDigits(s?.whatsappNumber)), required: true },
     { key: 'logo', step: 2, label: 'Upload your logo', done: Boolean(s?.logo?.url) },
     { key: 'cover', step: 2, label: 'Add a cover image', done: Boolean(s?.coverImage?.url) },
     { key: 'description', step: 3, label: 'Describe your business', done: Boolean(s?.description?.trim()) },
@@ -121,6 +129,7 @@ const buildChecklist = (store, productCount) => {
     { key: 'publish', step: 6, label: 'Publish your store', done: Boolean(s) && s.isPublished !== false, required: true },
   ];
 };
+
 const formatStore = (store) => {
   if (!store) return null;
   const obj = store.toObject();
@@ -128,6 +137,7 @@ const formatStore = (store) => {
   obj.whatsappDigits = toDigits(obj.whatsappNumber);
   return obj;
 };
+
 const buildState = async (vendorId) => {
   const [owner, store] = await Promise.all([
     User.findById(vendorId).select('name email phone'),
@@ -209,17 +219,24 @@ exports.saveStore = async (req, res) => {
     for (const key of ['state', 'city', 'address']) {
       if (b[key] !== undefined) store.set(`location.${key}`, clean(b[key], key === 'address' ? 200 : 60));
     }
+
     if (b.hasPhysicalStore !== undefined) {
-  store.hasPhysicalStore = b.hasPhysicalStore === true || b.hasPhysicalStore === 'true';
-}
-if (b.mapLink !== undefined) {
-  const link = normalizeMapLink(b.mapLink);
-  if (link === null) throw new InputError(MAP_LINK_HELP);
-  store.mapLink = link;
-}
-if ((b.hasPhysicalStore !== undefined || b.address !== undefined) && store.hasPhysicalStore && !store.location?.address?.trim()) {
-  throw new InputError('Add your shop address so customers can find you, or switch off "I have a physical shop".');
-}
+      store.hasPhysicalStore = b.hasPhysicalStore === true || b.hasPhysicalStore === 'true';
+    }
+    if (b.mapLink !== undefined) {
+      const link = normalizeMapLink(b.mapLink);
+      if (link === null) throw new InputError(MAP_LINK_HELP);
+      store.mapLink = link;
+    }
+    // A physical shop needs an address, otherwise customers have nothing to find
+    if (
+      (b.hasPhysicalStore !== undefined || b.address !== undefined) &&
+      store.hasPhysicalStore &&
+      !store.location?.address?.trim()
+    ) {
+      throw new InputError('Add your shop address so customers can find you, or switch off "I have a physical shop".');
+    }
+
     for (const key of ['instagram', 'facebook', 'tiktok', 'twitter', 'website']) {
       if (b[key] !== undefined) store.set(`socialLinks.${key}`, normalizeSocial(key, b[key]));
     }
@@ -433,14 +450,14 @@ exports.sendReminders = async (req, res) => {
         await sendEmail({
           to: user.email,
           subject: copy.subject,
-          text: `Hi ${user.name || 'there'},\n\n${copy.body}\n\n${copy.cta}: ${link}\n\nYou can stop these reminders any time: ${unsubscribe}`,
+          text: `Hi ${user.name || 'there'},\n\n${copy.body}\n\n${copy.cta}: ${link}\n\nTo stop these reminders and other optional emails from Vendira: ${unsubscribe}`,
           html: `
             <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#111827;line-height:1.55">
               <h2 style="color:#128C7E">${escapeHtml(copy.headline)}</h2>
               <p>Hi ${firstName},</p>
               <p>${escapeHtml(copy.body)}</p>
               <p style="margin:26px 0"><a href="${link}" style="background:#128C7E;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">${escapeHtml(copy.cta)}</a></p>
-              <p style="font-size:12px;color:#6b7280">This is a one-off reminder about your unfinished setup. <a href="${unsubscribe}" style="color:#6b7280">Stop these reminders</a>.</p>
+              <p style="font-size:12px;color:#6b7280">This is a one-off reminder about your unfinished setup. <a href="${unsubscribe}" style="color:#6b7280">Stop these reminders and other optional emails</a>.</p>
             </div>`,
         });
         await User.updateOne({ _id: user._id }, { $inc: { onboardingReminderCount: 1 }, lastOnboardingReminderAt: new Date() });
@@ -458,7 +475,10 @@ exports.sendReminders = async (req, res) => {
   }
 };
 
-// One-click opt-out from the email link
+// ==========================================
+// One-click opt-out from the email link.
+// Covers every optional email: setup reminders and announcements sent from the admin panel.
+// ==========================================
 exports.unsubscribe = async (req, res) => {
   const page = (title, text, code = 200) =>
     res.status(code).send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
@@ -466,12 +486,23 @@ exports.unsubscribe = async (req, res) => {
       <h2 style="color:#128C7E">${title}</h2><p>${text}</p></body>`);
 
   try {
-    const { u, t } = req.query;
+    // Without the secret the signature could be guessed, so refuse to work at all
+    if (!process.env.JWT_SECRET) {
+      console.error('Unsubscribe is disabled: JWT_SECRET is not set.');
+      return page('Something went wrong', 'Please try again later.', 500);
+    }
+
+    const u = String(req.query.u || '');
+    const t = String(req.query.t || '');
     if (!mongoose.Types.ObjectId.isValid(u) || !t || !safeEqual(t, unsubToken(u))) {
       return page('Link not valid', 'This unsubscribe link is not valid or has expired.', 400);
     }
+
     await User.updateOne({ _id: u }, { remindersOptOut: true });
-    return page('You are unsubscribed', "You won't receive setup reminders from Vendira any more.");
+    return page(
+      'You are unsubscribed',
+      "You won't receive optional emails from Vendira any more, such as setup reminders and announcements. Important emails about your account, like password resets, will still reach you."
+    );
   } catch (error) {
     console.error('Unsubscribe Error:', error);
     return page('Something went wrong', 'Please try again later.', 500);
